@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+
+# --- Poetry / venv ---
+# Dans ton monorepo, tu actives `poetry config virtualenvs.in-project true`
+# Donc on isole le venv local par package
+.venv/
+venv/
+.env
+.env.*
+
+# --- Build / Dist ---
+dist/
+build/
+*.whl
+*.tar.gz
+
+# --- Caches ---
+.mypy_cache/
+.pytest_cache/
+ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Logs / Temp ---
+*.log
+logs/
+*.sqlite3
+.DS_Store
+Thumbs.db
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.iml
+
+
+# --- Docker ---
+*.pid
+*.sock
+*.db
+docker-data/
