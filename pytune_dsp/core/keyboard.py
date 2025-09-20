@@ -3,17 +3,11 @@ from typing import Dict
 import numpy as np
 import librosa
 import math
+from pytune_dsp.types.analysis import Keyboard
 from pytune_dsp.types.enums import A4, StretchingModel, TuningMethod
 
 
-@dataclass(frozen=True)
-class Keyboard:
-    A4: float
-    lower_note: str
-    upper_note: str
-    frequencies: Dict[str, float]   # { "A0": 27.5, "A#0": 29.1, ... }
-    jnd: Dict[str, float]           # { "A0": 3.5 cents, ... }
-    strings_per_note: Dict[str, int]
+
 
 
 # ---------- Scale generation ----------

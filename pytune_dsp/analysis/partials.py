@@ -1,173 +1,126 @@
-"""
-partials.py
-===========
-Outils pour analyser les partiels et l’inharmonicité d’une note.
-Inclut des méthodes via STFT et un prototype de Yin récursif.
-"""
+# pytune_dsp/analysis/partials.py
 
 import numpy as np
 import librosa
 from scipy.signal import butter, filtfilt
 
-from pytune_dsp.types.analysis import NoteDeviationAnalysis
-from pytune_dsp.types.analysis import Keyboard  # si tu as remplacé TemperedKeyboard
+# --- interpolation quadratique autour d'un pic spectral (3 bins) ---
+def _parabolic(freq_bins: np.ndarray, mags: np.ndarray, k: int) -> float:
+    """
+    Affine la fréquence du pic autour du bin k par fit parabolique (k-1,k,k+1).
+    Retourne la fréquence estimée (Hz). Revient à freq_bins[k] si k est en bord
+    ou si la parabole est dégénérée.
+    """
+    if k <= 0 or k >= len(mags) - 1:
+        return float(freq_bins[k])
+    m1, m2, m3 = mags[k - 1], mags[k], mags[k + 1]
+    denom = (m1 - 2.0 * m2 + m3)
+    if denom == 0.0:
+        return float(freq_bins[k])
+    delta = 0.5 * (m1 - m3) / denom  # décalage sous-bin (en bins)
+    bin_step = freq_bins[1] - freq_bins[0]
+    return float(freq_bins[k] + delta * bin_step)
 
-# -------------------------------
-# Partials via STFT
-# -------------------------------
 
-def compute_partials_stft(
-    nb_partials: int,
-    note_analysis: NoteDeviationAnalysis,
+def compute_partials_fft_peaks(
+    signal: np.ndarray,
     sr: int,
-    n_fft: int = 2048,
+    f0_ref: float,
+    nb_partials: int = 8,
+    n_fft: int = 8192,
     hop_length: int = 512,
-) -> list[tuple[float, float]]:
+    search_width_cents: float = 80.0,
+    pad_factor: int = 2,
+) -> tuple[list[float], list[tuple[float, float]], list[float]]:
     """
-    Estime les partiels d’une note par STFT.
+    Estime les partiels via FFT + recherche locale autour de k*f0_ref
+    (± search_width_cents) et interpolation quadratique.
 
-    Parameters
-    ----------
-    nb_partials : int
-        Nombre de partiels à calculer.
-    note_analysis : NoteDeviationAnalysis
-        Analyse contenant le signal et la meilleure F0.
-    sr : int
-        Sample rate.
-    n_fft : int
-        Taille de FFT (par défaut 2048).
-    hop_length : int
-        Décalage entre fenêtres.
-
-    Returns
-    -------
-    partials : list of (freq, amplitude)
-        Liste des fréquences et amplitudes des partiels.
+    Retourne (harmonics, partials, inharmonicity):
+    - harmonics: [k*f0_ref] théoriques
+    - partials: [(freq_hz, amplitude), ...]
+    - inharmonicity: déviation en cents de chaque partiel vs k*f0_ref
     """
-    f0 = note_analysis.measurements.best_measurement
-    if f0 <= 0:
-        return []
+    if f0_ref <= 0.0 or signal.size == 0:
+        return [], [], []
 
-    # STFT
-    S = np.abs(librosa.stft(note_analysis.signal, n_fft=n_fft, hop_length=hop_length))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=S.shape[0])
+    # STFT (fenêtre Hann par défaut)
+    S = np.abs(librosa.stft(signal, n_fft=n_fft * pad_factor, hop_length=hop_length))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft * pad_factor)
 
-    partials = []
-    for i in range(1, nb_partials + 1):
-        target = i * f0
-        idx = np.argmin(np.abs(freqs - target))
-        amp = float(np.max(S[idx, :]))
-        partials.append((freqs[idx], amp))
+    # agrégation temporelle -> max (spectre global)
+    spec = np.max(S, axis=1)
 
-    return partials
+    harmonics = [k * f0_ref for k in range(1, nb_partials + 1)]
+    partials: list[tuple[float, float]] = []
+    inharm: list[float] = []
+
+    # borne max exploitable (éviter Nyquist)
+    f_max_usable = freqs[-1] * 0.995
+    ratio = 2.0 ** (search_width_cents / 1200.0)
+
+    for k, target in enumerate(harmonics, start=1):
+        if target >= f_max_usable:
+            break
+
+        # fenêtre de recherche autour de target
+        low = max(freqs[0], target / ratio)
+        high = min(f_max_usable, target * ratio)
+        if high <= low:
+            break
+
+        low_idx = np.searchsorted(freqs, low, side="left")
+        high_idx = np.searchsorted(freqs, high, side="right")
+        if high_idx - low_idx < 3:
+            continue
+
+        sub = spec[low_idx:high_idx]
+
+        # --- logique spéciale pour k=1 ---
+        if k == 1:
+            # on force à prendre le bin le plus proche de f0_ref
+            k0 = np.argmin(np.abs(freqs[low_idx:high_idx] - target)) + low_idx
+        else:
+            # on prend le maximum local dans la fenêtre
+            rel_k = np.argmax(sub)
+            k0 = low_idx + rel_k
+
+        f_est = _parabolic(freqs, spec, k0)
+        amp = float(spec[k0])
+
+        # clip si hors fenêtre
+        if not (low <= f_est <= high):
+            f_est = float(freqs[k0])
+
+        partials.append((f_est, amp))
+        inharm.append(1200.0 * np.log2(f_est / target) if f_est > 0 else 0.0)
+
+    return harmonics, partials, inharm
 
 
-# -------------------------------
-# Inharmonicité simple
-# -------------------------------
+def bandpass_filter(x: np.ndarray, sr: int, low: float, high: float, order: int = 6) -> np.ndarray:
+    """Filtre passe-bande Butterworth."""
+    nyq = sr * 0.5
+    lowc = max(1e-6, low / nyq)
+    highc = min(0.99, high / nyq)
+    b, a = butter(order, [lowc, highc], btype="band")
+    return filtfilt(b, a, x)
 
-def calculate_inharmonicity(note_analysis: NoteDeviationAnalysis) -> list[float]:
+
+def estimate_B(f0: float, partials_hz: list[float]) -> float:
     """
-    Calcule l’inharmonicité en cents entre les partiels et la F0.
-
-    Parameters
-    ----------
-    note_analysis : NoteDeviationAnalysis
-        Analyse contenant F0 et partiels.
-
-    Returns
-    -------
-    inharmonicity : list of float
-        Déviation en cents de chaque partiel par rapport à la F0.
+    Estime B via r_k^2 - 1 ≈ B k^2 (régression through-origin).
     """
-    f0 = note_analysis.measurements.best_measurement
-    if f0 <= 0 or not note_analysis.partials:
-        return []
-
-    return [1200 * np.log2(freq / f0) for freq, _ in note_analysis.partials]
-
-
-# -------------------------------
-# Recursive Yin (prototype)
-# -------------------------------
-
-def compute_partials_recursive_yin(
-    kbd: Keyboard,
-    nb_partials: int,
-    note_analysis: NoteDeviationAnalysis,
-    sr: int,
-) -> tuple[list[float], np.ndarray, list[float]]:
-    """
-    Estimation des partiels via Yin récursif :
-    on filtre successivement autour de chaque harmonique
-    et on applique Yin dans cette bande.
-
-    Parameters
-    ----------
-    kbd : Keyboard
-        Clavier de référence pour calculer les bornes de recherche.
-    nb_partials : int
-        Nombre de partiels à analyser.
-    note_analysis : NoteDeviationAnalysis
-        Signal + F0.
-    sr : int
-        Sample rate.
-
-    Returns
-    -------
-    harmonics : list[float]
-        Harmoniques idéales (k*f0).
-    partials : np.ndarray
-        Fréquences estimées des partiels.
-    inharmonicity : list[float]
-        Déviations en demi-tons (ou cents si adapté).
-    """
-    f0 = note_analysis.measurements.best_measurement
-    if f0 <= 0:
-        return [], np.array([]), []
-
-    signal = note_analysis.signal
-    partials = np.zeros(nb_partials)
-    harmonics = [f0 * i for i in range(1, nb_partials + 1)]
-
-    for i, target in enumerate(harmonics, start=1):
-        fmin = kbd.add_semitones_to_note(target, -1)
-        fmax = kbd.add_semitones_to_note(target, +1)
-
-        # filtrage passe-bas centré autour de l’harmonique
-        filtered_signal = lowpass_filter(signal, sr, cutoff_freq=2 * target)
-
-        Y = librosa.yin(filtered_signal, fmin=fmin, fmax=fmax, sr=sr)
-        if len(Y) > 0:
-            partials[i - 1] = Y[0]  # TODO: améliorer (moyenne stable etc.)
-
-    inharmonicity = [kbd.distance_semitone(f1, f2) for f1, f2 in zip(partials, harmonics)]
-    return harmonics, partials, inharmonicity
-
-
-# -------------------------------
-# Filtrage
-# -------------------------------
-
-def lowpass_filter(signal: np.ndarray, sr: int, cutoff_freq: float, order: int = 6) -> np.ndarray:
-    """
-    Applique un filtre passe-bas Butterworth.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Signal temporel.
-    sr : int
-        Sample rate.
-    cutoff_freq : float
-        Fréquence de coupure (Hz).
-    order : int
-        Ordre du filtre.
-
-    Returns
-    -------
-    filtered : np.ndarray
-        Signal filtré.
-    """
-    b, a = butter(order, cutoff_freq / (sr / 2), btype="low")
-    return filtfilt(b, a, signal)
+    ks, y = [], []
+    for k, fk in enumerate(partials_hz, start=1):
+        if fk > 0.0 and f0 > 0.0:
+            r = fk / (k * f0)
+            ks.append(k)
+            y.append(r * r - 1.0)
+    if len(ks) < 2:
+        return 0.0
+    ks = np.asarray(ks, float)
+    y = np.asarray(y, float)
+    num = np.sum((ks ** 2) * y)
+    den = np.sum(ks ** 4)
+    return float(num / den) if den > 0.0 else 0.0

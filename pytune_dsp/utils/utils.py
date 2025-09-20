@@ -2,6 +2,14 @@ import numpy as np
 from pytune_dsp.core.keyboard import Keyboard
 
 
+# pytune_dsp/utils/note_utils.py
+
+# pytune_dsp/utils/note_utils.py
+
+import numpy as np
+
+
+
 def cents_between(f1: float, f2: float) -> float:
     return 1200 * np.log2(f2 / f1)
 

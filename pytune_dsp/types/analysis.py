@@ -1,8 +1,17 @@
 from dataclasses import dataclass, field
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pytune_dsp.types.enums import SampleType
 
+
+@dataclass(frozen=True)
+class Keyboard:
+    A4: float
+    lower_note: str
+    upper_note: str
+    frequencies: Dict[str, float]   # { "A0": 27.5, "A#0": 29.1, ... }
+    jnd: Dict[str, float]           # { "A0": 3.5 cents, ... }
+    strings_per_note: Dict[str, int]
 
 @dataclass
 class PyTuneScanData:
@@ -24,6 +33,15 @@ class PyTuneScanData:
         end = int(self.relative_time_stamps[end] * self.sr)
         return self.signal[start:end]
 
+@dataclass
+class SimpleNoteMeasures:
+    stable_f0: float = 0.0
+    mode_rate: float = 0.0
+    centroid: float = 0.0
+    best_method: str = "stableF0Average"
+    best_value: float = 0.0
+    dev_cents_vs_ref: float = 0.0
+    dev_hz_vs_ref: float = 0.0
 
 @dataclass
 class NoteMeasurements:

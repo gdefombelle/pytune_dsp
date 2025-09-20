@@ -1,5 +1,14 @@
 from enum import Enum
 
+class SampleType(Enum):
+    FILE_CHROMATIC_SCALE = 0
+    FILE_DIATONIC_SCALE = 1
+    FILE_SINGLE_NOTE = 2
+    FILE_TWO_NOTES = 3
+    TRIAD = 4
+    FILE_PARTITION = 5
+    FILE_INTERVAL = 6
+    NONE = 99
 
 class TuningMethod(Enum):
     EQUAL_TEMPERAMENT = 0     # Tempérament égal pur
