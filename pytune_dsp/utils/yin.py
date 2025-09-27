@@ -24,7 +24,6 @@ def yin_window(expected_freq: float, semitones: float = 0.5) -> tuple[float, flo
     fmax = expected_freq * ratio
     return fmin, fmax
 
-
 def yin_with_adaptive_window(
     signal: np.ndarray,
     sr: int,
@@ -34,33 +33,17 @@ def yin_with_adaptive_window(
     total_notes: int | None = None,
 ) -> np.ndarray:
     """
-    YIN avec choix intelligent de la taille de fenêtre selon la fréquence.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Signal audio mono (1D).
-    sr : int
-        Sample rate.
-    fmin : float
-        Fréquence minimale attendue (Hz).
-    fmax : float
-        Fréquence maximale attendue (Hz).
-    idx_note : int | None
-        Index de la note dans l’échelle (A0=0, A#0=1...).
-    total_notes : int | None
-        Nombre total de notes, utile pour ajustement heuristique.
-
-    Returns
-    -------
-    f0s : np.ndarray
-        Estimations de fréquence fondamentale par trames.
+    YIN avec choix intelligent de la taille de fenêtre selon la fréquence,
+    et sécurisation des paramètres pour éviter les erreurs librosa.
     """
-    # Par défaut : fenêtre basée sur fmin
+    # Base : fenêtre proportionnelle à fmin (2 périodes min)
     frame_length = int((2 * sr) / fmin)
+    frame_length = max(512, frame_length)  # sécurité bas médium
+    if frame_length % 2 == 1:  # doit être pair
+        frame_length += 1
     win_length = frame_length // 2
 
-    # Heuristique : ajustement selon la tessiture
+    # Heuristique tessiture
     if idx_note is not None and total_notes is not None:
         if 0 <= idx_note <= 25:  # très graves
             frame_length, win_length = 8192, 4096
@@ -68,6 +51,11 @@ def yin_with_adaptive_window(
             frame_length, win_length = 4096, 2048
         else:  # médiums-aigus
             frame_length, win_length = 1024, 512
+
+    # 🔹 Clamp fmax si trop petit
+    min_required = sr / frame_length + 1
+    if fmax < min_required:
+        fmax = min_required
 
     return librosa.yin(
         signal,

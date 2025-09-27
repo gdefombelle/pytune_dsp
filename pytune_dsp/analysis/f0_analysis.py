@@ -12,7 +12,7 @@ import numpy as np
 from collections import Counter
 
 from pytune_dsp.utils.yin import yin_with_adaptive_window
-from pytune_dsp.types.analysis import SimpleNoteMeasures
+from pytune_dsp.types.dataclasses import SimpleNoteMeasures
 
 
 # ============================================================

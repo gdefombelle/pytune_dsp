@@ -1,7 +1,42 @@
 from dataclasses import dataclass, field
-import numpy as np
-from typing import List, Optional, Dict
 from pytune_dsp.types.enums import SampleType
+import numpy as np
+from typing import Dict, List, Optional
+
+@dataclass
+class GuessF0Result:
+    f0: float | None
+    confidence: float
+    harmonics: list[float]          # fréquences détectées (FFT peaks)
+    matched: list[tuple[int, float, float]]  # (n, freq_detectée, err_cents)
+
+
+@dataclass
+class GuessNoteResult:
+    midi: int | None
+    f0: float | None
+    confidence: float
+    method: str  # "pattern", "fft", "fusion", "none"
+
+@dataclass
+class NoteAnalysisResult:
+    note_name: str
+    valid: bool
+    f0: float | None
+    confidence: float
+    deviation_cents: float | None
+    expected_freq: float | None
+    harmonics: list[float]
+    partials: list[float]
+    inharmonicity: dict | None
+    inharmonicity_avg: float | None
+    B_estimate: float | None
+    spectral_fingerprint: np.ndarray | None
+    harmonic_spectrum_raw: np.ndarray | None
+    harmonic_spectrum_norm: np.ndarray | None
+    response: dict | None
+    guessed_note: GuessNoteResult | None  # <--- nouveau
+
 
 
 @dataclass(frozen=True)

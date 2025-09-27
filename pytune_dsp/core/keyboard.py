@@ -3,7 +3,7 @@ from typing import Dict
 import numpy as np
 import librosa
 import math
-from pytune_dsp.types.analysis import Keyboard
+from pytune_dsp.types.dataclasses import Keyboard
 from pytune_dsp.types.enums import A4, StretchingModel, TuningMethod
 
 

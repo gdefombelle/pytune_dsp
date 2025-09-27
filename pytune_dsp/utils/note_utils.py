@@ -1,3 +1,5 @@
+import numpy as np
+
 # Dictionnaire des noms en notation anglo-saxonne et solfège
 NOTE_TO_MIDI = {
     # Anglo-saxon
@@ -103,3 +105,9 @@ def freq_to_note(
         }
 
     return f"{mapping[pitch_class]}{octave}"
+
+# 🔹 Nouveau : obtenir triplet (midi, nom, freq) directement
+def freq_to_midi_note_freq(freq: float, a4: float = 440.0, use_solfège: bool = False):
+    midi = freq_to_midi(freq, a4)
+    note = freq_to_note(freq, a4, use_solfège=use_solfège)
+    return midi, note, midi_to_freq(midi, a4)
