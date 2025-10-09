@@ -1,6 +1,6 @@
 # src/models/schemas.py
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 
 class NoteCaptureMeta(BaseModel):
@@ -24,11 +24,17 @@ class NoteCaptureMeta(BaseModel):
 class GuessNoteResult(BaseModel):
     midi: Optional[int] = None
     f0: Optional[float] = None
-    confidence: float = 0.0
-    method: str = "none"   # "pattern", "fft", "fusion", "none"
+    confidence: float
+    method: str
+
+    # ✅ nouveaux champs
+    debug_log: Optional[List[str]] = None     # lignes détaillées
+    subresults: Optional[Dict[str, dict]] = None  # yinfft / fft / hps / comb etc.
+    envelope_band: Optional[str] = None       # "low", "mid", "high"
 
 
 class NoteAnalysisResult(BaseModel):
+    midi: Optional[int] = None 
     note_name: str
     valid: bool
     f0: Optional[float] = None
@@ -36,22 +42,22 @@ class NoteAnalysisResult(BaseModel):
     deviation_cents: Optional[float] = None   # écart vs expected
     expected_freq: Optional[float] = None     # traçabilité
 
-    harmonics: List[float] = []               # fréquences théoriques k*f0
-    partials: List[float] = []                # fréquences mesurées (Hz)
-    inharmonicity: List[float] = []           # déviation (cents, un par partiel)
+    harmonics: List[float] = []
+    partials: List[float] = []
+    inharmonicity: List[float] = []
 
-    spectral_fingerprint: List[float] = []    # compact, normalisé (hash-like)
+    spectral_fingerprint: List[float] = []
 
-    # Ajouts spectre harmonique
-    harmonic_spectrum_raw: List[Tuple[float, float]] = []   # (freq, amplitude brute)
-    harmonic_spectrum_norm: List[Tuple[float, float]] = []  # (freq, amplitude normalisée 0–1)
+    harmonic_spectrum_raw: List[Tuple[float, float]] = []
+    harmonic_spectrum_norm: List[Tuple[float, float]] = []
 
-    # 🔹 Nouveaux ajouts utiles pour le frontend
-    inharmonicity_avg: Optional[float] = None  # moyenne pondérée/simplifiée en cents
-    B_estimate: Optional[float] = None         # coefficient B global estimé
+    inharmonicity_avg: Optional[float] = None
+    B_estimate: Optional[float] = None
 
-    # 🔹 Ajout : note détectée par guess_note
-    guessed_note: Optional[GuessNoteResult] = None
+    # 🔹 Résultat canonique → choisi comme “meilleure hypothèse”
+    guessed_note: Optional["GuessNoteResult"] = None
 
-    # 🔹 Ajout : stockage éventuel de la réponse (long sustain, decay, etc.)
+    # 🔹 Tous les résultats détaillés
+    guesses: Dict[str, "GuessNoteResult"] = {}
+
     response: Optional[dict] = None

@@ -1,22 +1,39 @@
 from dataclasses import dataclass, field
 from pytune_dsp.types.enums import SampleType
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 @dataclass
 class GuessF0Result:
     f0: float | None
     confidence: float
-    harmonics: list[float]          # fréquences détectées (FFT peaks)
-    matched: list[tuple[int, float, float]]  # (n, freq_detectée, err_cents)
+    harmonics: list[float]
+    matched: list[tuple[int, float, float]]
 
+    # ✅ nouveaux champs pour la fusion complète
+    method: str = "none"                  # ex: "YINFFT+FFT"
+    band: str = "unknown"                 # "low" | "mid" | "high"
+    components: dict[str, dict] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)  
+    # ex:
+    # {
+    #   "yinfft": {"f0": 27.57, "conf": 0.93},
+    #   "fft": {"f0": 27.50, "score": 0.687},
+    #   "hps": {"f0": 27.83, "conf": 0.90},
+    #   "comb": {"f0": 27.30, "conf": 0.65}
+    # }
 
 @dataclass
 class GuessNoteResult:
     midi: int | None
     f0: float | None
     confidence: float
-    method: str  # "pattern", "fft", "fusion", "none"
+    method: str
+
+    # ✅ nouveaux champs pour correspondre au modèle Pydantic
+    debug_log: list[str] | None = None
+    subresults: dict[str, dict] | None = None
+    envelope_band: str | None = None
 
 @dataclass
 class NoteAnalysisResult:
