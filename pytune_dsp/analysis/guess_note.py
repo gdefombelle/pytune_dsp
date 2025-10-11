@@ -1,10 +1,12 @@
-# guess_note.py — PyTune DSP v0.6 (band classification + anti-subharmonic fusion)
+# guess_note.py — PyTune DSP v0.7
+# (band classification + early-attack YIN + anti-subharmonic fusion + threaded engine)
 
 from __future__ import annotations
 from typing import Optional, Tuple, List
 import numpy as np
 import librosa
 from scipy.signal import hilbert
+from concurrent.futures import ThreadPoolExecutor
 
 from pytune_dsp.types.dataclasses import GuessNoteResult, GuessF0Result
 
@@ -16,16 +18,19 @@ LOW_BAND_MAX = 200.0
 EPS = 1e-12
 
 # Attack analysis
-ATTACK_MS = 80
-HF_CUTOFF = 2000.0  # SAR cutoff
+ATTACK_MS = 80          # fenêtre courte pour l'analyse d'attaque (~80ms)
+HF_CUTOFF = 2000.0      # seuil HF pour SAR
+
 
 def freq_to_midi(f: float) -> Optional[int]:
     if not f or f <= 0:
         return None
     return int(round(MIDI_A4 + 12 * np.log2(f / NOTE_A4)))
 
+
 def midi_to_freq(m: int) -> float:
     return NOTE_A4 * (2.0 ** ((m - MIDI_A4) / 12.0)) if m else 0.0
+
 
 def _freq_to_note_name(f: float) -> str:
     if not f or f <= 0:
@@ -35,16 +40,20 @@ def _freq_to_note_name(f: float) -> str:
              "G", "G#", "A", "A#", "B"]
     return f"{names[m % 12]}{m // 12 - 1}"
 
+
 def _cents_between(f1: float, f2: float) -> float:
     return 1200.0 * np.log2(f1 / f2)
+
 
 def _hann(N: int) -> np.ndarray:
     n = np.arange(N)
     return 0.5 - 0.5 * np.cos(2 * np.pi * n / max(N - 1, 1))
 
+
 def adaptive_fft_size(fmin: float, sr: int, periods: int = 12) -> int:
     target = int(np.ceil(sr * periods / max(fmin, 1e-3)))
     return int(2 ** np.ceil(np.log2(max(target, 2048))))
+
 
 # ---------- Envelope / band ----------
 def hilbert_envelope(x: np.ndarray) -> np.ndarray:
@@ -52,12 +61,13 @@ def hilbert_envelope(x: np.ndarray) -> np.ndarray:
     env /= np.max(env) + 1e-12
     return env
 
+
 def classify_band_advanced(x: np.ndarray, sr: int) -> tuple[str, float, float, float, float]:
     """
     Retourne (band, t_attack, scr, zcr, sar)
     - t_attack: temps au pic d'enveloppe (s)
     - scr: spectral centroid / (sr/2)
-    - zcr: zero-crossing rate sur les ~80 ms initiaux
+    - zcr: zero-crossing rate sur l'attaque (~80 ms)
     - sar: ratio d'énergie HF (>2 kHz) sur l'attaque (~80 ms)
     """
     # 1) Attack envelope
@@ -95,17 +105,16 @@ def classify_band_advanced(x: np.ndarray, sr: int) -> tuple[str, float, float, f
     except Exception:
         sar = 0.0
 
-    # 6) Decision (seuils robustes, moins de biais “low”)
-    # low si attaque nettement lente OU (son sombre + peu d'HF au départ + zcr faible)
-    if (t_attack > 0.12) or ((scr < 0.12) and (sar < 0.12) and (zcr < 0.05)):
+    # 6) Decision — moins de biais "low"
+    if (t_attack > 0.12 and scr < 0.15) or (scr < 0.10 and sar < 0.10 and zcr < 0.05):
         band = "low"
-    # high si beaucoup d'HF et structure riche/rapide
-    elif (sar > 0.35 and scr > 0.25) or (t_attack < 0.035 and (scr > 0.33 or zcr > 0.08)):
+    elif (sar > 0.35 and (scr > 0.25 or zcr > 0.08)) or (t_attack < 0.030 and scr > 0.33):
         band = "high"
     else:
         band = "mid"
 
     return band, t_attack, scr, zcr, sar
+
 
 # ---------- FFT / HPS ----------
 def _rfft_mag(signal: np.ndarray, sr: int, fmin: float = 25.0,
@@ -123,6 +132,7 @@ def _rfft_mag(signal: np.ndarray, sr: int, fmin: float = 25.0,
         hi = int(np.searchsorted(freqs, LOW_BAND_MAX, side="right"))
         spec[hi:] *= 0.2
     return freqs, spec
+
 
 def guess_f0_fft(signal: np.ndarray, sr: int,
                  n_harmonics: int = 8,
@@ -149,6 +159,7 @@ def guess_f0_fft(signal: np.ndarray, sr: int,
         print(f"[FFT] → {best_f0:.2f} Hz ({_freq_to_note_name(best_f0)}) score={best_score:.3f}")
     return best_f0, float(np.tanh(best_score))
 
+
 def guess_f0_hps(signal: np.ndarray, sr: int,
                  max_down: int = 5,
                  band: str = "mid",
@@ -163,7 +174,6 @@ def guess_f0_hps(signal: np.ndarray, sr: int,
         Sd = S[::d]
         H[:len(Sd)] += np.log(Sd + EPS)
 
-    # bornes : en mid/high, on ignore les très basses fréquences parasites
     fmin = 40.0 if band != "low" else A0_FREQ
     i_min = int(np.searchsorted(freqs, fmin))
     i_max = int(np.searchsorted(freqs, min(1000.0, freqs[-1])))
@@ -178,30 +188,26 @@ def guess_f0_hps(signal: np.ndarray, sr: int,
         print(f"[HPS] → {f0:.2f} Hz ({_freq_to_note_name(f0)}) conf={conf:.2f}")
     return f0, conf
 
+
 # ---------- YinFFT ----------
-def guess_f0_yinfft(signal: np.ndarray, sr: int,
-                    fmin: float = 20.0, fmax: float = 2000.0,
-                    debug: bool = True) -> Tuple[Optional[float], float]:
+def _yin_core(signal: np.ndarray, sr: int, fmin: float, fmax: float) -> Tuple[Optional[float], float]:
     x = signal.astype(np.float64)
     x -= np.mean(x)
     N = len(x)
+    if N < 8:
+        return None, 0.0
     fft_size = int(2 ** np.ceil(np.log2(2 * N)))
     X = np.fft.rfft(x, n=fft_size)
-    r = np.fft.irfft(np.abs(X)**2, n=fft_size)
-    r = r[:N]
-
+    r = np.fft.irfft(np.abs(X)**2, n=fft_size)[:N]
     d = np.zeros(N)
-    d[0] = 0.0
     d[1:] = np.cumsum(x[:-1]**2)[-1] + np.cumsum(x[1:]**2)[-1] - 2*r[1:]
     d /= np.max(np.abs(d)) + 1e-12
-
     cmnd = np.zeros_like(d)
-    cmnd[0] = 1
+    cmnd[0] = 1.0
     acc = 0.0
-    for tau in range(1, len(d)):
+    for tau in range(1, N):
         acc += d[tau]
         cmnd[tau] = d[tau] / (acc / tau)
-
     tau_min = int(sr / fmax)
     tau_max = int(sr / fmin)
     if tau_max <= tau_min + 1:
@@ -209,13 +215,33 @@ def guess_f0_yinfft(signal: np.ndarray, sr: int,
     tau = np.argmin(cmnd[tau_min:tau_max]) + tau_min
     f0 = sr / tau if tau > 0 else None
     conf = 1 - cmnd[tau] if f0 else 0.0
+    return f0, conf
+
+
+def guess_f0_yinfft(signal: np.ndarray, sr: int,
+                    fmin: float = 20.0, fmax: float = 2000.0,
+                    debug: bool = True) -> Tuple[Optional[float], float]:
+    f0, conf = _yin_core(signal, sr, fmin, fmax)
     if debug and f0:
         print(f"[YINFFT] → {f0:.2f} Hz ({_freq_to_note_name(f0)}) conf={conf:.2f}")
     return f0, conf
 
+
+def guess_f0_yinfft_early(signal: np.ndarray, sr: int,
+                          fmin: float = 200.0, fmax: float = 4000.0,
+                          debug: bool = True) -> Tuple[Optional[float], float]:
+    """YIN sur la seule attaque (≈80 ms), utile pour l'aigu."""
+    win_len = int(ATTACK_MS / 1000.0 * sr)
+    x_attack = signal[: min(len(signal), win_len)]
+    f0, conf = _yin_core(x_attack, sr, fmin, fmax)
+    if debug and f0:
+        print(f"[YINFFT-early] → {f0:.2f} Hz ({_freq_to_note_name(f0)}) conf={conf:.2f}")
+    return f0, conf
+
+
 # ---------- Comb (low only) ----------
 def comb_search_low(signal: np.ndarray, sr: int,
-                    fmin: float = 20.0, fmax: float = 100.0,
+                    fmin: float = 20.0, fmax: float = 120.0,
                     step_hz: float = 0.1,
                     kmax: int = 6,
                     debug: bool = True) -> Tuple[Optional[float], float]:
@@ -241,12 +267,22 @@ def comb_search_low(signal: np.ndarray, sr: int,
         print(f"[COMB] → {best_f0:.2f} Hz ({_freq_to_note_name(best_f0)}) conf={conf:.2f}")
     return best_f0, conf
 
-# ---------- Fusion ----------
+
+# ---------- Fusion (threaded) ----------
 def _near_octave(f_lo: float, f_hi: float, cents_tol: float = 30.0) -> bool:
     if f_lo <= 0 or f_hi <= 0:
         return False
     ratio = f_hi / f_lo
     return abs(_cents_between(ratio, 2.0)) < cents_tol
+
+
+def _safe_call(func, *args, **kwargs):
+    """Exécute func dans un thread et capture toute exception → (None, 0.0)."""
+    try:
+        return func(*args, **kwargs)
+    except Exception:
+        return (None, 0.0)
+
 
 def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0Result:
     band, t_attack, scr, zcr, sar = classify_band_advanced(signal, sr)
@@ -255,27 +291,52 @@ def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0R
 
     max_freq_limit = sr * 0.45
     if band == "low":
-        yin_fmin, yin_fmax = (20, min(220, max_freq_limit))   # ↑ 220 Hz pour couvrir A3
+        yin_fmin, yin_fmax = (20, min(220, max_freq_limit))
     else:
         yin_fmin, yin_fmax = (50, min(3000, max_freq_limit))
-
     prefer_low = band == "low"
 
-    yin_f0, yin_conf = guess_f0_yinfft(signal, sr, yin_fmin, yin_fmax, debug)
-    fft_f0, fft_score = guess_f0_fft(signal, sr, fmin=yin_fmin, prefer_low_band=prefer_low, debug=debug)
-    hps_f0, hps_conf = guess_f0_hps(signal, sr, band=band, debug=debug)
+    # ---- Lancer les tâches en parallèle ----
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        fut_yin = executor.submit(_safe_call, guess_f0_yinfft, signal, sr, yin_fmin, yin_fmax, debug)
+        fut_fft = executor.submit(_safe_call, guess_f0_fft, signal, sr, fmin=yin_fmin, prefer_low_band=prefer_low, debug=debug)
+        fut_hps = executor.submit(_safe_call, guess_f0_hps, signal, sr, band=band, debug=debug)
 
-    comb_f0, comb_conf = (None, 0.0)
-    if band == "low" and fft_f0 and fft_f0 < 140:
-        comb_f0, comb_conf = comb_search_low(signal, sr, debug=debug)
+        fut_yin_early = None
+        if band == "high":
+            fut_yin_early = executor.submit(_safe_call, guess_f0_yinfft_early, signal, sr, 200.0, 4000.0, debug)
 
-    # Candidats initiaux
-    cand = [(l, f, c) for (l, f, c) in [
-        ("YINFFT", yin_f0, yin_conf),
+        # Récupération des résultats principaux
+        yin_f0, yin_conf = fut_yin.result()
+        fft_f0, fft_score = fut_fft.result()
+        hps_f0, hps_conf = fut_hps.result()
+        if band == "high":
+            yin_e_f0, yin_e_conf = fut_yin_early.result()
+            # cohérence YIN full / early → boost (identique à v0.6.1)
+            if yin_f0 and yin_e_f0 and abs(_cents_between(yin_f0, yin_e_f0)) < 40:
+                yin_e_conf = min(1.0, max(yin_conf, yin_e_conf) + 0.15)
+        else:
+            yin_e_f0, yin_e_conf = (None, 0.0)
+
+        if band == "high":
+            hps_conf *= 0.7  # même atténuation qu'avant en aigu
+
+        # COMB : conditionnel après avoir FFT
+        if band == "low" and fft_f0 and fft_f0 < 140:
+            fut_comb = executor.submit(_safe_call, comb_search_low, signal, sr, 20.0, 120.0, 0.1, 6, debug)
+            comb_f0, comb_conf = fut_comb.result()
+        else:
+            comb_f0, comb_conf = (None, 0.0)
+
+    # ---- Fusion identique ----
+    cand_raw = [
+        ("YINFFT", yin_f0, float(yin_conf)),
+        ("YINFFT-early", yin_e_f0, float(yin_e_conf)),
         ("FFT", fft_f0, float(fft_score)),
-        ("HPS", hps_f0, hps_conf),
-        ("COMB", comb_f0, comb_conf),
-    ] if f and f > 20.0]
+        ("HPS", hps_f0, float(hps_conf)),
+        ("COMB", comb_f0, float(comb_conf)),
+    ]
+    cand = [(l, f, c) for (l, f, c) in cand_raw if f and f > 20.0]
 
     if not cand:
         return GuessF0Result(
@@ -283,42 +344,27 @@ def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0R
             method="none", band=band, components={}, extra={"t_attack": t_attack, "scr": scr, "zcr": zcr, "sar": sar}
         )
 
-    # Anti-subharmonique : si un couple est quasi-octave, favoriser le plus élevé (surtout mid/high)
-    # et/ou dévaloriser le plus bas.
-    def boost(label: str, base_boost: float) -> float:
-        # bonus plafonné
-        return min(1.0, base_boost)
-
-    adjusted = []
-    for l, f, c in cand:
-        adjusted.append([l, f, c])
-
+    adjusted = [list(x) for x in cand]
     for i in range(len(cand)):
         li, fi, ci = cand[i]
         for j in range(i + 1, len(cand)):
             lj, fj, cj = cand[j]
             f_lo, f_hi = (fi, fj) if fi <= fj else (fj, fi)
-            if _near_octave(f_lo, f_hi, cents_tol=30.0):
-                # Si mid/high : on préfère le plus haut; si low : on ne change rien
-                if band != "low":
-                    # boost pour le haut, petite pénalité pour le bas
-                    if fi > fj:
-                        adjusted[i][2] = boost(li, max(ci, cj) + 0.25)
-                        adjusted[j][2] = max(0.0, adjusted[j][2] - 0.10)
-                    else:
-                        adjusted[j][2] = boost(lj, max(ci, cj) + 0.25)
-                        adjusted[i][2] = max(0.0, adjusted[i][2] - 0.10)
+            if _near_octave(f_lo, f_hi, cents_tol=30.0) and band != "low":
+                if fi > fj:
+                    adjusted[i][2] = min(1.0, max(ci, cj) + 0.25)
+                    adjusted[j][2] = max(0.0, adjusted[j][2] - 0.10)
+                else:
+                    adjusted[j][2] = min(1.0, max(ci, cj) + 0.25)
+                    adjusted[i][2] = max(0.0, adjusted[i][2] - 0.10)
 
-    # Cas spécifique fréquent : FFT ≈ 2× YIN → renforcer YIN
     if yin_f0 and fft_f0 and _near_octave(yin_f0, fft_f0, cents_tol=30.0):
         for k, (l, f, c) in enumerate(adjusted):
-            if l == "YINFFT":
-                adjusted[k][2] = boost(l, c + 0.20)
+            if l.startswith("YINFFT"):
+                adjusted[k][2] = min(1.0, c + 0.20)
 
-    # Score final
     label, final_f, final_c = max(adjusted, key=lambda t: t[2])
 
-    # Rapprochement si deux candidats proches (< 25 cents)
     for i in range(len(adjusted)):
         for j in range(i + 1, len(adjusted)):
             l1, f1, c1 = adjusted[i]
@@ -335,6 +381,7 @@ def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0R
 
     components = {
         "yinfft": {"f0": yin_f0 or 0.0, "conf": yin_conf},
+        "yinfft_early": {"f0": yin_e_f0 or 0.0, "conf": yin_e_conf},
         "fft": {"f0": fft_f0 or 0.0, "score": float(fft_score)},
         "hps": {"f0": hps_f0 or 0.0, "conf": hps_conf},
         "comb": {"f0": comb_f0 or 0.0, "conf": comb_conf},
@@ -345,6 +392,7 @@ def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0R
         method=label, band=band, components=components,
         extra={"t_attack": t_attack, "scr": scr, "zcr": zcr, "sar": sar}
     )
+
 
 # ---------- API ----------
 def guess_note(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResult:
@@ -359,11 +407,13 @@ def guess_note(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResu
     extra = getattr(res, "extra", {}) or {}
 
     yin = res.components.get("yinfft", {})
+    yin_e = res.components.get("yinfft_early", {})
     fft = res.components.get("fft", {})
     hps = res.components.get("hps", {})
     comb = res.components.get("comb", {})
 
     yin_f0, yin_conf = yin.get("f0"), yin.get("conf")
+    yin_e_f0, yin_e_conf = yin_e.get("f0"), yin_e.get("conf")
     fft_f0, fft_score = fft.get("f0"), fft.get("score")
     hps_f0, hps_conf = hps.get("f0"), hps.get("conf")
     comb_f0, comb_conf = comb.get("f0"), comb.get("conf")
@@ -372,14 +422,13 @@ def guess_note(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResu
     debug_lines: List[str] = []
     debug_lines.append(f"Envelope band detected: {band}")
     debug_lines.append(
-        "Envelope features: "
-        f"t_attack={extra.get('t_attack', 0.0)*1000:.1f}ms, "
-        f"scr={extra.get('scr', 0.0):.3f}, "
-        f"zcr={extra.get('zcr', 0.0):.3f}, "
-        f"sar={extra.get('sar', 0.0):.3f}"
+        f"Envelope features: t_attack={extra.get('t_attack', 0.0)*1000:.1f}ms, "
+        f"scr={extra.get('scr', 0.0):.3f}, zcr={extra.get('zcr', 0.0):.3f}, sar={extra.get('sar', 0.0):.3f}"
     )
     if yin_f0:
         debug_lines.append(f"[YINFFT] → {yin_f0:.2f} Hz ({_freq_to_note_name(yin_f0)}) conf={yin_conf:.2f}")
+    if yin_e_f0:
+        debug_lines.append(f"[YINFFT-early] → {yin_e_f0:.2f} Hz ({_freq_to_note_name(yin_e_f0)}) conf={yin_e_conf:.2f}")
     if fft_f0:
         debug_lines.append(f"[FFT] → {fft_f0:.2f} Hz ({_freq_to_note_name(fft_f0)}) score={(fft_score or 0):.3f}")
     if hps_f0:
