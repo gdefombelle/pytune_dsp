@@ -6,10 +6,9 @@ import essentia, essentia.standard as es
 essentia.log.infoActive = False
 
 # --- importe la fonction guess_note où qu'elle se trouve dans le package ---
-try:
-    from pytune_dsp.analysis.guess_note import guess_note as guess_f0  # v0.7 dans sous-module analysis
-except Exception:
-    from pytune_dsp.guess_note import guess_note as guess_f0           # fallback si placé à la racine
+
+from pytune_dsp.analysis.guess_note import guess_note as guess_f0  # v0.7 dans sous-module analysis
+
 
 # ---------- utils ----------
 def cents(a: float, b: float) -> float:
