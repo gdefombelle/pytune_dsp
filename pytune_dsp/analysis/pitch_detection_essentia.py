@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, List, Tuple, Dict
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Essentia
 import essentia
@@ -10,8 +11,41 @@ import essentia.standard as es
 
 from pytune_dsp.types.dataclasses import GuessNoteResult, GuessF0Result
 
+# ======================================================
+# -------- FFT micro-cache (optionnel et thread-safe) ---
+# ======================================================
+ENABLE_FFT_CACHE = True
+_FFT_CACHE_LOCK = threading.Lock()
+# key: (ptr, length, sr, nfft, prefer_low_band) -> (freqs, mag)
+_FFT_CACHE: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+def _key_for_signal(y: np.ndarray) -> tuple[int, int]:
+    """Génère une clé stable basée sur le pointeur mémoire + longueur du signal."""
+    ptr = int(y.__array_interface__['data'][0])
+    return (ptr, y.shape[0])
+
+def _rfft_mag_lowpref_cached(y: np.ndarray, sr: int, nfft: int, prefer_low_band: bool):
+    """Version avec cache de _rfft_mag_lowpref."""
+    if not ENABLE_FFT_CACHE:
+        return _rfft_mag_lowpref(y, sr, nfft, prefer_low_band)
+
+    base = _key_for_signal(y)
+    key = (base[0], base[1], int(sr), int(nfft), bool(prefer_low_band))
+    with _FFT_CACHE_LOCK:
+        hit = _FFT_CACHE.get(key)
+        if hit is not None:
+            return hit
+
+    freqs, mag = _rfft_mag_lowpref(y, sr, nfft, prefer_low_band)
+    with _FFT_CACHE_LOCK:
+        if len(_FFT_CACHE) > 24:
+            _FFT_CACHE.pop(next(iter(_FFT_CACHE)))
+        _FFT_CACHE[key] = (freqs, mag)
+    return freqs, mag
+
+# ======================================================
+
 NOTE_A4, MIDI_A4 = 440.0, 69
-A0_FREQ, A0_MIDI = 27.50, 21
 EPS = 1e-12
 
 # Attack / cutoff
@@ -19,7 +53,7 @@ ATTACK_MS = 80.0
 HF_CUTOFF = 2000.0
 NFFT = 2048
 HOP = 256
-EARLY_MS = 60.0  # fenêtre attaque pour aigus
+EARLY_MS = 60.0
 
 # --- logging ---
 ESS_PREFIX = "[ESS]"
@@ -52,19 +86,12 @@ def _slice_early(y: np.ndarray, sr: int, dur_ms: float) -> np.ndarray:
 
 # ---------- Band classification ----------
 def classify_band_essentia(y: np.ndarray, sr: int) -> Tuple[str, Dict[str, float]]:
-    """
-    Calibrated version (v2.1) aligned with librosa's classify_band_advanced.
-    Corrige les erreurs de bande sur les notes A4–A6 (fausses low).
-    """
     y = _np_f32(y)
-
-    # --- Enveloppe / attaque ---
     env = es.Envelope()(y)
     env /= (np.max(env) + EPS)
     idx_peak = int(np.argmax(env))
     t_attack = idx_peak / sr
 
-    # --- Spectral centroid global ---
     w = es.Windowing(type="hann")
     sp = es.Spectrum()
     fc = es.FrameGenerator(y, frameSize=NFFT, hopSize=HOP, startFromZero=True)
@@ -78,7 +105,6 @@ def classify_band_essentia(y: np.ndarray, sr: int) -> Tuple[str, Dict[str, float
         cents.append(num / denom if denom > 0 else 0.0)
     scr = float((np.mean(cents) if cents else 0.0) / (sr * 0.5 + EPS))
 
-    # --- Attack window ---
     win_len = int((ATTACK_MS / 1000.0) * sr)
     win = y[: min(len(y), win_len)]
     if np.allclose(win, 0.0):
@@ -90,25 +116,20 @@ def classify_band_essentia(y: np.ndarray, sr: int) -> Tuple[str, Dict[str, float
     total = float(np.sum(spec)) + EPS
     sar = float(np.sum(spec[freqs_att >= HF_CUTOFF]) / total)
 
-    # --- Decision logic (revised thresholds) ---
-    # 1) Graves
     if (t_attack > 0.12 and scr < 0.15) or (scr < 0.10 and sar < 0.10 and zcr < 0.05):
         band = "low"
-    # 2) Aigus
     elif (sar > 0.25 and (scr > 0.18 or zcr > 0.06)) or (t_attack < 0.030 and scr > 0.18):
         band = "high"
-    # 3) Par défaut
     else:
         band = "mid"
 
-    # --- Correction dynamique post-pondération ---
-    # (évite les A4–A6 classées low à tort)
     if band == "low" and (scr > 0.045 and sar > 0.12):
         band = "mid"
     if band == "mid" and (sar > 0.20 and scr > 0.07 and zcr > 0.04):
         band = "high"
 
     return band, {"t_attack": t_attack, "scr": scr, "zcr": zcr, "sar": sar}
+
 def _search_bounds(band: str, sr: int) -> Tuple[float, float]:
     max_freq_limit = sr * 0.45
     if band == "low":
@@ -118,25 +139,72 @@ def _search_bounds(band: str, sr: int) -> Tuple[float, float]:
     else:
         return 50.0, min(3000.0, max_freq_limit)
 
-# ---------- Helpers spectrum / comb ----------
-def _rfft_mag_lowpref(y: np.ndarray, sr: int, nfft: int, prefer_low_band: bool = False):
+# ---------- FFT / HPS / COMB (cache-enabled) ----------
+def _rfft_mag(y: np.ndarray, sr: int, nfft: int) -> Tuple[np.ndarray, np.ndarray]:
     w = es.Windowing(type="hann")
     sp = es.Spectrum(size=nfft)
     mag = sp(w(_np_f32(y)))
     freqs = np.linspace(0.0, sr * 0.5, len(mag), dtype=np.float64)
-    mag = np.asarray(mag, dtype=np.float64)
+    return freqs, np.asarray(mag, dtype=np.float64)
+
+def _rfft_mag_lowpref(y: np.ndarray, sr: int, nfft: int, prefer_low_band: bool = False):
+    freqs, mag = _rfft_mag(y, sr, nfft)
     mag *= 1.0 / np.maximum(freqs, 1e-6)
     if prefer_low_band:
         hi = int(np.searchsorted(freqs, 200.0, side="right"))
         mag[hi:] *= 0.25
     return freqs, mag
 
+def fft_anchor_fundamental(y: np.ndarray, sr: int, fmin: float, fmax: float, debug: bool=False):
+    nfft = max(4096, 1 << int(np.ceil(np.log2(len(y)))))
+    freqs, mag = _rfft_mag_lowpref_cached(y, sr, nfft, prefer_low_band=(fmax<=220))
+    lo = int(np.searchsorted(freqs, fmin, side="left"))
+    hi = int(np.searchsorted(freqs, min(fmax, 1000.0), side="right"))
+    if hi <= lo:
+        return None, 0.0
+    seg = mag[lo:hi]
+    idx = int(np.argmax(seg)) + lo
+    f0 = float(freqs[idx])
+    peak = float(seg.max())
+    base = float(np.median(seg) + 1e-9)
+    conf = float(np.clip((peak / base) / 20.0, 0.0, 1.0))
+    if debug:
+        _ess_log(True, f"[FFT*] → {f0:.2f} Hz ({_freq_to_note_name(f0)}) conf={conf:.2f}")
+    return f0, conf
+
+def hps_search(y: np.ndarray, sr: int, fmin: float, fmax: float, debug: bool=False):
+    nfft = max(4096, 1 << int(np.ceil(np.log2(len(y)))))
+    freqs, mag = _rfft_mag_lowpref_cached(y, sr, nfft, prefer_low_band=False)
+    mag = mag / (mag.max() + EPS)
+
+    hps = mag.copy()
+    for r in (2, 3, 4, 5):
+        dec = mag[::r]
+        hps[:len(dec)] *= dec
+
+    lo = int(np.searchsorted(freqs, fmin, side="left"))
+    hi = int(np.searchsorted(freqs, fmax, side="right"))
+    if hi <= lo:
+        return None, 0.0
+    seg = hps[lo:hi]
+    if seg.size == 0 or np.all(seg <= 0):
+        return None, 0.0
+    idx = int(np.argmax(seg)) + lo
+    f0 = float(freqs[idx])
+    left, right = max(lo, idx - 3), min(hi, idx + 4)
+    local = hps[left:right]
+    prom = float((hps[idx] - np.median(local)) / (np.max(local) + EPS))
+    conf = float(np.clip(0.5 + 0.5 * np.tanh(3.0 * prom), 0.0, 1.0))
+    if debug:
+        _ess_log(True, f"[HPS] → {f0:.2f} Hz ({_freq_to_note_name(f0)}) conf={conf:.2f}")
+    return f0, conf
+
 def comb_search_low_ess(y: np.ndarray, sr: int,
                         fmin: float = 20.0, fmax: float = 120.0,
                         step_hz: float = 0.1, kmax: int = 6,
                         prefer_low_band: bool = True, debug: bool = False):
     nfft = max(8192, 1 << int(np.ceil(np.log2(len(y) * 2))))
-    freqs, mag = _rfft_mag_lowpref(y, sr, nfft, prefer_low_band=prefer_low_band)
+    freqs, mag = _rfft_mag_lowpref_cached(y, sr, nfft, prefer_low_band=prefer_low_band)
     if mag.max() <= 0:
         return None, 0.0
     mag_norm = mag / (mag.max() + EPS)
@@ -159,6 +227,8 @@ def comb_search_low_ess(y: np.ndarray, sr: int,
     if debug:
         _ess_log(True, f"[COMB*] → {best_f0:.2f} Hz ({_freq_to_note_name(best_f0)}) conf={conf:.2f}")
     return best_f0, conf
+
+# (le reste du fichier inchangé : cand_yinfft, cand_mpk, guess_f0_essentia, guess_note_essentia, etc.)
 
 # ---------- Candidates ----------
 def _adaptive_framesize(fmin: float, sr: int, periods: int = 12, min_pow2: int = 4096, max_pow2: int = 32768):
@@ -269,74 +339,143 @@ def guess_f0_essentia(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF
     sr = int(sr)
     band, feats = classify_band_essentia(signal, sr)
     fmin, fmax = _search_bounds(band, sr)
-    _ess_log(debug, "=== Essentia guess_f0 (YINFFT + MPK) ===")
+    _ess_log(debug, "=== Essentia guess_f0 (YINFFT core) ===")
     _ess_log(debug, f"band={band} | t_attack={feats['t_attack']*1000:.1f}ms | scr={feats['scr']:.3f} | zcr={feats['zcr']:.3f} | sar={feats['sar']:.3f}")
     _ess_log(debug, f"search: [{fmin:.1f}, {fmax:.1f}] Hz")
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        fut_yin = ex.submit(cand_yinfft, signal, sr, fmin, fmax, debug)
-        fut_mpk = ex.submit(cand_mpk, signal, sr, fmin, fmax, debug)
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        fut_yin  = ex.submit(cand_yinfft,        signal, sr, fmin, fmax, debug)
+        fut_fft  = ex.submit(fft_anchor_fundamental, signal, sr, fmin, fmax, debug)
+        fut_hps  = ex.submit(hps_search,         signal, sr, max(80.0, fmin), fmax, debug) if band != "low" else None
         fut_comb = ex.submit(comb_search_low_ess, signal, sr, 20.0, 120.0, 0.1, 6, True, debug) if band == "low" else None
-        fut_yin_early = ex.submit(cand_yinfft_early, signal, sr, fmin, fmax, debug) if band != "low" else None
+        fut_mpk  = ex.submit(cand_mpk,           signal, sr, fmin, fmax, debug) if band != "low" else None
+        fut_yine = ex.submit(cand_yinfft_early,  signal, sr, fmin, fmax, debug) if band != "low" else None
 
-        yin_f0, yin_conf = fut_yin.result()
-        mpk_f0, mpk_conf, mpk_bag = fut_mpk.result()
+        yin_f0,  yin_conf  = fut_yin.result()
+        fft_f0,  fft_conf  = fut_fft.result()
+        hps_f0,  hps_conf  = (fut_hps.result()  if fut_hps  else (None, 0.0))
         comb_f0, comb_conf = (fut_comb.result() if fut_comb else (None, 0.0))
-        yinE_f0, yinE_conf = (fut_yin_early.result() if fut_yin_early else (None, 0.0))
+        mpk_f0,  mpk_conf, mpk_bag = (fut_mpk.result() if fut_mpk else (None, 0.0, []))
+        yie_f0,  yie_conf  = (fut_yine.result() if fut_yine else (None, 0.0))
 
-    cands = [
-        ("YINFFT", yin_f0, yin_conf),
-        ("MPK", mpk_f0, mpk_conf),
-        ("COMB*", comb_f0, comb_conf if band == "low" else 0.0),
-        ("YINFFT-early", yinE_f0, yinE_conf if band != "low" else 0.0),
-    ]
-    cands = [(l, f, c) for (l, f, c) in cands if f and f > 0]
+    # --- Post-correction d’octave pour les graves (sécurité Librosa-free) ---
+    #
+    # Objectif : corriger les rares cas où YINFFT détecte la 2e harmonique (~2× trop haut)
+    #             alors que la FFT ou COMB détecte la vraie fondamentale (autour de 50–110 Hz).
+    #
+    # --- Post-correction d’octave globale (graves & médiums) ---
+    #
+    # Corrige :
+    #  - YINFFT qui saute une octave (2× trop haut sur A0–A2)
+    #  - YINFFT qui sous-évalue (½ trop bas sur A4–A5)
+    #  - Bandes "low" mal classées quand la fondamentale dépasse 200 Hz
+    #
+    if yin_f0 and fft_f0:
+        ratio = yin_f0 / fft_f0
+
+        # Correction d’octave (double ou demi)
+        if band == "low":
+            # Cas 1 : YINFFT détecte la 2e harmonique (trop haut)
+            if ratio > 1.8 and fft_conf > 0.5:
+                _ess_log(debug, f"[Anti-octave LOW] YIN={yin_f0:.2f} / FFT={fft_f0:.2f} → ÷2")
+                yin_f0 *= 0.5
+            # Cas 2 : YINFFT détecte la moitié (trop bas)
+            elif ratio < 0.55 and fft_conf > 0.5:
+                _ess_log(debug, f"[Anti-octave LOW] YIN={yin_f0:.2f} / FFT={fft_f0:.2f} → ×2")
+                yin_f0 *= 2.0
+
+        # Sécurité : si on est encore très au-dessus du domaine "low", on reclasse en "mid"
+        if band == "low" and yin_f0 > 200.0:
+            _ess_log(debug, f"[Reclassify] {yin_f0:.2f} Hz déplacé en mid-band")
+            band = "mid"
+
+    # Correction de cohérence : en zone mid, YIN ne doit jamais être < 70 Hz ni > 2 kHz
+    if band == "mid" and yin_f0:
+        if yin_f0 < 70.0:
+            _ess_log(debug, f"[Clamp-mid] YINFFT corrigé de {yin_f0:.2f} Hz → 70 Hz")
+            yin_f0 = 70.0
+        elif yin_f0 > 2000.0:
+            _ess_log(debug, f"[Clamp-mid] YINFFT corrigé de {yin_f0:.2f} Hz → 2000 Hz")
+            yin_f0 = 2000.0
+    # --- Bonus de consensus YIN+FFT (renforce la confiance si proche) ---
+    if band != "low" and yin_f0 and fft_f0:
+        delta_cents = abs(_cents(yin_f0, fft_f0))
+        if delta_cents < 10.0:  # très proche (≈ <0.1 demi-ton)
+            yin_conf = min(1.0, yin_conf + 0.1)
+            fft_conf = min(1.0, fft_conf + 0.1)
+            _ess_log(debug, f"[Consensus] YIN+FFT accordés ({delta_cents:.1f} cents) → +0.1 confiance")
+    
+
+    # Candidats valides
+    cands: List[Tuple[str, float, float, float]] = []  # (label, f0, conf, weight)
+    def add(label, f, c, w): 
+        if f and f > 0: cands.append((label, float(f), float(c), float(w)))
+
+    # pondérations par défaut
+    add("YINFFT",        yin_f0, yin_conf, 1.00)
+    add("FFT*",          fft_f0, fft_conf, 0.70)
+    if band != "low":
+        add("HPS",       hps_f0, hps_conf, 0.65)
+        add("MPK",       mpk_f0, mpk_conf, 0.80)
+        add("YINFFT-early", yie_f0, yie_conf, 0.60)
+    else:
+        add("COMB*",     comb_f0, comb_conf, 0.85)
+
+    # filtre haute bande (sécurité)
     if band == "high":
-        cands = [(l, f, c) for (l, f, c) in cands if f >= 150.0]
+        cands = [c for c in cands if c[1] >= 150.0]
 
     if not cands:
         return GuessF0Result(f0=None, confidence=0.0, harmonics=[], matched=[],
                              method="none", band=band, components={}, extra=feats)
 
-    adj = [list(x) for x in cands]
-    for i in range(len(adj)):
-        for j in range(i + 1, len(adj)):
-            fi, ci = adj[i][1], adj[i][2]
-            fj, cj = adj[j][1], adj[j][2]
-            if _near_octave(fi, fj, tol_cents=25.0):
-                low_idx = i if fi < fj else j
-                high_idx = j if fi < fj else i
-                adj[low_idx][2] = min(1.0, max(ci, cj) + (0.20 if band == "low" else 0.10))
-                adj[high_idx][2] = max(0.0, adj[high_idx][2] - 0.05)
-            if abs(_cents(fi, fj)) < 25:
-                f_mean = 0.5 * (fi + fj)
-                c_boost = min(1.0, max(ci, cj) + 0.2)
-                adj[i] = [f"{adj[i][0]}+{adj[j][0]}", f_mean, c_boost]
+    # Anti-octave ciblé en grave : si YIN>120Hz et COMB/HPS ~ moitié → favoriser la basse
+    if band == "low" and yin_f0 and yin_f0 > 120.0:
+        for (lab, f, c, w) in cands:
+            if lab in ("COMB*", "FFT*") and (20.0 <= f <= 120.0) and _near_octave(yin_f0, f*2.0, tol_cents=35.0):
+                # boost forte de la basse, baisse la haute
+                cands = [ (lab2, f2, (c2+0.35 if lab2==lab else c2-0.10), w2) 
+                          for (lab2,f2,c2,w2) in cands ]
+                break
 
-    adj = [(l, f, (c + 0.05) if (band == "high" and "YINFFT-early" in l) else c) for (l, f, c) in adj]
-    label, f_final, c_final = max(adj, key=lambda t: t[2])
-    _ess_log(debug, f"🎯 Fusion → {f_final:.2f} Hz ({_freq_to_note_name(f_final)}) conf={c_final:.2f} method={label}")
+    # Fusion : moyenne pondérée par (conf * weight); bonus si quasi-consensus
+    best_label, best_f, best_score = None, None, -1.0
+    for i in range(len(cands)):
+        li, fi, ci, wi = cands[i]
+        score_i = ci * wi
+        # consensus local
+        for j in range(i+1, len(cands)):
+            lj, fj, cj, wj = cands[j]
+            if abs(_cents(fi, fj)) < 20.0:
+                score_i += 0.20 * max(ci*wi, cj*wj)
+        if score_i > best_score:
+            best_label, best_f, best_score = li, fi, score_i
+
+    # Confiance finale bornée [0,1]
+    conf_final = float(np.clip(best_score, 0.0, 1.0))
+    _ess_log(debug, f"🎯 Fusion → {best_f:.2f} Hz ({_freq_to_note_name(best_f)}) conf={conf_final:.2f} method={best_label}")
 
     components = {
         "yinfft": {"f0": yin_f0 or 0.0, "conf": float(yin_conf)},
-        "mpk": {"f0": mpk_f0 or 0.0, "conf": float(mpk_conf), "bag_n": len(mpk_bag or [])},
+        "fft": {"f0": fft_f0 or 0.0, "conf": float(fft_conf)},
+        "hps": {"f0": hps_f0 or 0.0, "conf": float(hps_conf)},
         "comb": {"f0": comb_f0 or 0.0, "conf": float(comb_conf)},
-        "yinfft_early": {"f0": yinE_f0 or 0.0, "conf": float(yinE_conf)},
+        "mpk": {"f0": mpk_f0 or 0.0, "conf": float(mpk_conf), "bag_n": len(mpk_bag or [])},
+        "yinfft_early": {"f0": yie_f0 or 0.0, "conf": float(yie_conf)},
     }
 
-       # ---------- suite et fin de guess_f0_essentia ----------
-    # Info mismatch toléré (diagnostic)
-    if band == "low" and f_final > 400:
+    # Infos de mismatch
+    if band == "low" and best_f > 400:
         _ess_log(debug, "[Info] Band mismatch tolerated — high freq found in low band window.")
-    if band == "mid" and f_final < 100:
+    if band == "mid" and best_f < 100:
         _ess_log(debug, "[Info] Band mismatch tolerated — low freq found in mid band window.")
 
     return GuessF0Result(
-        f0=float(f_final),
-        confidence=float(c_final),
+        f0=float(best_f),
+        confidence=conf_final,
         harmonics=[],
         matched=[],
-        method=label,
+        method=best_label,
         band=band,
         components=components,
         extra=feats,
@@ -344,9 +483,6 @@ def guess_f0_essentia(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF
 
 # ---------- API ----------
 def guess_note_essentia(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResult:
-    """
-    Interface publique : retourne un GuessNoteResult à partir d’un signal mono.
-    """
     res = guess_f0_essentia(signal, sr, debug=debug)
     if not res.f0:
         return GuessNoteResult(midi=None, f0=None, confidence=0.0, method="none")
@@ -364,24 +500,20 @@ def guess_note_essentia(signal: np.ndarray, sr: int, debug: bool = True) -> Gues
         f"zcr={feats.get('zcr', 0.0):.3f} | "
         f"sar={feats.get('sar', 0.0):.3f}"
     ]
-
-    # logs des sous-composants
     if comps.get("yinfft", {}).get("f0"):
         log.append(f"[YINFFT] → {comps['yinfft']['f0']:.2f} Hz conf={comps['yinfft']['conf']:.2f}")
     if comps.get("yinfft_early", {}).get("f0"):
         log.append(f"[YINFFT-early] → {comps['yinfft_early']['f0']:.2f} Hz conf={comps['yinfft_early']['conf']:.2f}")
+    if comps.get("hps", {}).get("f0"):
+        log.append(f"[HPS] → {comps['hps']['f0']:.2f} Hz conf={comps['hps']['conf']:.2f}")
+    if comps.get("fft", {}).get("f0"):
+        log.append(f"[FFT*] → {comps['fft']['f0']:.2f} Hz conf={comps['fft']['conf']:.2f}")
     if comps.get("mpk", {}).get("f0"):
-        log.append(
-            f"[MPK] → {comps['mpk']['f0']:.2f} Hz conf={comps['mpk']['conf']:.2f} "
-            f"(bag={comps['mpk']['bag_n']})"
-        )
+        log.append(f"[MPK] → {comps['mpk']['f0']:.2f} Hz conf={comps['mpk']['conf']:.2f} (bag={comps['mpk']['bag_n']})")
     if comps.get("comb", {}).get("f0"):
         log.append(f"[COMB*] → {comps['comb']['f0']:.2f} Hz conf={comps['comb']['conf']:.2f}")
 
-    log.append(
-        f"🎯 Fusion → {f0_final:.2f} Hz ({note_name}) "
-        f"conf={conf_final:.2f} method={res.method}"
-    )
+    log.append(f"🎯 Fusion → {f0_final:.2f} Hz ({note_name}) conf={conf_final:.2f} method={res.method}")
 
     return GuessNoteResult(
         midi=freq_to_midi(f0_final),
@@ -389,6 +521,6 @@ def guess_note_essentia(signal: np.ndarray, sr: int, debug: bool = True) -> Gues
         confidence=conf_final,
         method=res.method,
         debug_log=log,
-        subresults=comps,     # ✅ pas de asdict() sur dict
+        subresults=comps,
         envelope_band=res.band,
     )

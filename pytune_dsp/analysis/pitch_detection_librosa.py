@@ -287,6 +287,7 @@ def _safe_call(func, *args, **kwargs):
 def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0Result:
     band, t_attack, scr, zcr, sar = classify_band_advanced(signal, sr)
     if debug:
+        print ("=== Librosa  guess_f0 ====")
         print(f"🔍 Envelope: band={band} | t_attack={t_attack*1000:.1f}ms | scr={scr:.3f} | zcr={zcr:.3f} | sar={sar:.3f}")
 
     max_freq_limit = sr * 0.45
