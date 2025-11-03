@@ -396,7 +396,7 @@ def guess_f0_fusion(signal: np.ndarray, sr: int, debug: bool = True) -> GuessF0R
 
 
 # ---------- API ----------
-def guess_note(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResult:
+def guess_note_librosa(signal: np.ndarray, sr: int, debug: bool = True) -> GuessNoteResult:
     res = guess_f0_fusion(signal, sr, debug=debug)
     if not res.f0:
         return GuessNoteResult(midi=None, f0=None, confidence=0.0, method="none")

@@ -1,9 +1,9 @@
 # pytune_dsp/analysis/partials.py — v2 (CZT-free, robust, joint f0+B fit)
-
 from __future__ import annotations
 import numpy as np
 import librosa
 from scipy.signal import butter, filtfilt
+from typing import List, Tuple
 
 # ---------------------------
 # Utils
@@ -25,7 +25,7 @@ def _parabolic_robust(freqs: np.ndarray, mags: np.ndarray, k: int) -> float:
     if abs(denom) < 1e-12:
         return float(freqs[k])
     delta = 0.5 * (l1 - l3) / denom
-    # clamp si aberrant (>1 bin = suspect)
+    # clamp si aberrant (> ~0.75 bin = suspect)
     delta = float(np.clip(delta, -0.75, 0.75))
     df = freqs[1] - freqs[0]
     return float(freqs[k] + delta * df)
@@ -47,7 +47,27 @@ def _local_snr(spec: np.ndarray, k: int, win: int = 6) -> float:
 
 
 def _cents(a: float, b: float) -> float:
+    """
+    Cents robustes — renvoie 0 si a ou b <= 0 pour éviter les NaN/inf.
+    """
+    if a <= 0.0 or b <= 0.0:
+        return 0.0
     return 1200.0 * np.log2(a / b)
+
+
+def _to_scalar_f0(f0_like) -> float:
+    """
+    Normalise une valeur 'f0': accepte float, tuple/list/np.ndarray (f0, ...).
+    Retourne un float >= 0 (0 si invalide).
+    """
+    try:
+        if isinstance(f0_like, (tuple, list, np.ndarray)):
+            if len(f0_like) == 0:
+                return 0.0
+            return float(f0_like[0]) if np.isfinite(f0_like[0]) else 0.0
+        return float(f0_like) if np.isfinite(float(f0_like)) else 0.0
+    except Exception:
+        return 0.0
 
 
 # ---------------------------
@@ -56,7 +76,7 @@ def _cents(a: float, b: float) -> float:
 def compute_partials_fft_peaks(
     signal: np.ndarray,
     sr: int,
-    f0_ref: float,
+    f0_ref,  # peut être float ou (f0, conf)
     nb_partials: int = 8,
     n_fft: int = 8192,
     hop_length: int = 512,
@@ -66,21 +86,26 @@ def compute_partials_fft_peaks(
     """
     Estime les partiels via FFT zero-paddée + recherche locale autour de k*f0_ref
     et interpolation parabolique robuste (log-mag).
+
     Retourne:
       - harmonics: [k*f0_ref]
       - partials:  [(f_est, amp, snr, k_harm), ...]
       - inharm:    [déviation en cents vs k*f0_ref]
     """
-    if f0_ref <= 0.0 or signal.size == 0:
+    # --- Normalisation & garde-fous ---
+    f0_ref_val = _to_scalar_f0(f0_ref)
+    if f0_ref_val <= 0.0 or signal is None or signal.size == 0:
         return [], [], []
 
     # STFT, spectre global = max temporel (stable sur sons soutenus)
-    N = n_fft * pad_factor
-    S = np.abs(librosa.stft(signal, n_fft=N, hop_length=hop_length))
+    N = int(n_fft) * int(pad_factor)
+    S = np.abs(librosa.stft(signal, n_fft=N, hop_length=hop_length, center=True))
+    if S.size == 0:
+        return [], [], []
     freqs = librosa.fft_frequencies(sr=sr, n_fft=N)
     spec = np.max(S, axis=1)
 
-    harmonics = [k * f0_ref for k in range(1, nb_partials + 1)]
+    harmonics = [k * f0_ref_val for k in range(1, nb_partials + 1)]
     partials: list[tuple[float, float, float, int]] = []
     inharm: list[float] = []
 
@@ -96,8 +121,8 @@ def compute_partials_fft_peaks(
         if high <= low:
             break
 
-        li = np.searchsorted(freqs, low, side="left")
-        hi = np.searchsorted(freqs, high, side="right")
+        li = int(np.searchsorted(freqs, low, side="left"))
+        hi = int(np.searchsorted(freqs, high, side="right"))
         if hi - li < 3:
             continue
 
@@ -159,7 +184,7 @@ def _robust_loss_cents(err_cents: np.ndarray, delta: float = 6.0) -> np.ndarray:
 
 
 def fit_f0_B(
-    partials: list[tuple[float, float, float, int]],
+    partials: List[Tuple[float, float, float, int]],
     f0_seed: float,
     B_min: float = 0.0,
     B_max: float = 3e-3,
@@ -194,7 +219,10 @@ def fit_f0_B(
             continue
         # erreur en cents vs modèle inharmonique
         pred = ks * f0 * np.sqrt(1.0 + B * (ks ** 2))
-        err_c = _cents(f_hz, pred)
+        # Evite divisions non-positives
+        safe_pred = np.where(pred <= 0, 1.0, pred)
+        safe_fhz  = np.where(f_hz <= 0,  1.0, f_hz)
+        err_c = 1200.0 * np.log2(safe_fhz / safe_pred)
         loss = np.sum(_robust_loss_cents(err_c, delta=6.0) * w)
         rms = float(np.sqrt(np.average(err_c ** 2, weights=w)))
         if loss < best[0]:
@@ -222,7 +250,7 @@ def bandpass_filter(x: np.ndarray, sr: int, low: float, high: float, order: int 
 def refine_f0_B_from_signal(
     signal: np.ndarray,
     sr: int,
-    f0_seed: float,
+    f0_seed,  # float ou (f0, conf)
     nb_partials: int = 6,
     n_fft: int = 8192,
     hop_length: int = 512,
@@ -234,22 +262,24 @@ def refine_f0_B_from_signal(
       2) fit conjoint (f0, B).
     Retourne un dict pratique pour le debug-panel.
     """
+    f0_seed_val = _to_scalar_f0(f0_seed)
+
     _, parts, _ = compute_partials_fft_peaks(
-        signal, sr, f0_seed,
+        signal, sr, f0_seed_val,
         nb_partials=nb_partials,
         n_fft=n_fft, hop_length=hop_length,
         search_width_cents=search_width_cents, pad_factor=2
     )
     if not parts:
         return {
-            "f0_refined": f0_seed,
+            "f0_refined": f0_seed_val,
             "B": 0.0,
             "rms_cents": 0.0,
             "n_partials": 0,
             "partials": []
         }
 
-    f0_refined, B, rms_c, n_used = fit_f0_B(parts, f0_seed)
+    f0_refined, B, rms_c, n_used = fit_f0_B(parts, f0_seed_val)
     return {
         "f0_refined": f0_refined,
         "B": B,
