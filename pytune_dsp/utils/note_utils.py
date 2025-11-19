@@ -111,3 +111,34 @@ def freq_to_midi_note_freq(freq: float, a4: float = 440.0, use_solfège: bool = 
     midi = freq_to_midi(freq, a4)
     note = freq_to_note(freq, a4, use_solfège=use_solfège)
     return midi, note, midi_to_freq(midi, a4)
+
+def midi_to_note(midi: int, use_solfège: bool = False) -> str:
+    """
+    Convertit un numéro MIDI en nom de note :
+      - 60 → C4 ou Do4
+      - 69 → A4 ou La4
+      - 56 → G#3 ou Sol♯3
+
+    use_solfège=True : notation latine
+    """
+
+    if not (0 <= midi <= 127):
+        raise ValueError(f"MIDI invalide: {midi}")
+
+    octave = midi // 12 - 1
+    pitch_class = midi % 12
+
+    if use_solfège:
+        mapping = {
+            0: "Do",  1: "Do♯", 2: "Ré",  3: "Mi♭", 4: "Mi",
+            5: "Fa",  6: "Fa♯", 7: "Sol", 8: "Sol♯", 9: "La",
+            10: "Si♭", 11: "Si",
+        }
+    else:
+        mapping = {
+            0: "C",  1: "C♯", 2: "D",  3: "E♭", 4: "E",
+            5: "F",  6: "F♯", 7: "G", 8: "G♯", 9: "A",
+            10: "B♭", 11: "B",
+        }
+
+    return f"{mapping[pitch_class]}{octave}"
