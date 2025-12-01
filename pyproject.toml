@@ -1,3 +1,10 @@
+
+[project]
+name = "pytune_dsp"
+version = "0.0.0"
+description = "PyTune digital signal processing utilities"
+requires-python = ">=3.12"
+
 [tool.poetry]
 name = "pytune_dsp"
 version = "0.1.0"
@@ -9,7 +16,7 @@ repository = "https://github.com/gdefombelle/pytune_dsp"
 packages = [{ include = "pytune_dsp" }]
 
 [tool.poetry.dependencies]
-python = ">=3.12,<3.13"
+python = ">=3.12,<4.0"
 numpy = "^1.26"
 scipy = "^1.14"
 librosa = "^0.10.2"
